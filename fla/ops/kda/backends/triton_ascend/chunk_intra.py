@@ -37,7 +37,12 @@ _SAFETY_MARGIN = 0.80
 _FALLBACK_BK = 16
 _MAX_INTER_BK = 128
 # limit programs per launch to stay within Ascend AICore task time.
-_KDA_LAUNCH_BLOCK_BUDGET = 4096
+# The fwd intra wrappers (sub-chunk / diag-solve / inter-solve) launch light
+# per-program kernels where split launches are pure overhead, so these
+# launches may exceed the repo-wide ASCEND_LAUNCH_BLOCK_BUDGET (4096) up to
+# 32768. Larger combinations still take the host-splitting fallback below,
+# and each single grid axis stays within ASCEND_MAX_GRID_DIM.
+_KDA_LAUNCH_BLOCK_BUDGET = 32768
 
 
 # disable auto-multi-buffer and AutoBlockify on the fused inter launch
@@ -278,6 +283,16 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_npu(
     p_Akk = tl.make_block_ptr(Akk, (T, BC), (HV * BC, 1), (i_ti, 0), (BC, BC), (1, 0))
     tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
     tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), boundary_check=(0, 1))
+
+    # Zero-fill this row band's other column blocks so Aqk can be allocated
+    # with torch.empty: each program owns the full BT-wide band of its BC rows
+    # (rows past T are masked off and belong to no band). The explicit zeros
+    # replace what the wrapper's host memset used to provide.
+    b_z = tl.zeros([BC, BC], dtype=tl.float32).to(Aqk.dtype.element_ty)
+    base_z = Aqk + tl.cast(i_ti, tl.int64) * (HV * BT) + o_i[:, None] * (HV * BT)
+    for j in tl.static_range(BT // BC):
+        if j != i_i:
+            tl.store(base_z + j * BC + o_i[None, :], b_z, mask=m_c[:, None])
 
 
 @triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
@@ -532,6 +547,19 @@ def chunk_kda_fwd_kernel_inter_solve_fused_npu(
         tl.store(p_Akk3 + 2 * BC + o_i[None, :], b_Ai32.to(Akk.dtype.element_ty), mask=m_tc3[:, None])
         tl.store(p_Akk3 + 3 * BC + o_i[None, :], b_Ai33_c.to(Akk.dtype.element_ty), mask=m_tc3[:, None])
 
+    # Zero-fill the strictly-upper column blocks of each row band so Akk can
+    # be allocated with torch.empty: the stores above cover blocks on and
+    # below the block diagonal, these cover the rest of the BT-wide band,
+    # replacing the wrapper's host memset.
+    b_z = tl.zeros([BC, BC], dtype=tl.float32).to(Akk.dtype.element_ty)
+    for j in tl.static_range(1, NC):
+        tl.store(p_Akk0 + j * BC + o_i[None, :], b_z, mask=m_tc0[:, None])
+    if NC >= 3:
+        for j in tl.static_range(2, NC):
+            tl.store(p_Akk1 + j * BC + o_i[None, :], b_z, mask=m_tc1[:, None])
+        for j in tl.static_range(3, NC):
+            tl.store(p_Akk2 + j * BC + o_i[None, :], b_z, mask=m_tc2[:, None])
+
 
 @input_guard
 def chunk_kda_fwd_intra_npu(
@@ -562,9 +590,25 @@ def chunk_kda_fwd_intra_npu(
     NC = triton.cdiv(BT, BC)
     is_varlen = cu_seqlens is not None
 
-    Aqk = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    Akk = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
-    Akkd = torch.zeros(B, T, HV, BC, device=k.device, dtype=torch.float32)
+    if safe_gate and not use_graph:
+        # Eager safe_gate only: sub_chunk writes every Aqk/Akkd row band in
+        # full (values on its own diagonal block, explicit zeros on the other
+        # column blocks) and inter_solve zero-fills Akk's strictly-upper
+        # blocks, so none of the three buffers needs the host memset.
+        # use_graph keeps the memset below: sentinel chunk rows return before
+        # writing their bands and rows past the runtime T stay unwritten, and
+        # graph replay requires padding rows to be physically zero (see
+        # fla/ops/utils/graph.py).
+        Aqk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
+        Akk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
+        Akkd = torch.empty(B, T, HV, BC, device=k.device, dtype=torch.float32)
+    else:
+        # token_parallel writes Aqk/Akkd sparsely and relies on zeros init;
+        # graph capture records the zeros memset and re-executes it on every
+        # replay, keeping the padding rows physically zero.
+        Aqk = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
+        Akk = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
+        Akkd = torch.zeros(B, T, HV, BC, device=k.device, dtype=torch.float32)
 
     if safe_gate:
         # the UB model for sub tiles is never binding for K<=128 (returns next_pow2(K)
